@@ -1,0 +1,37 @@
+[project]
+name = "copybook"
+version = "0.2.0"
+description = "Generate printable Chinese calligraphy practice sheets and copybooks."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "pypdf>=5.0",
+    "segno>=1.6.6",
+]
+
+[project.scripts]
+copybook = "copybook.cli:main"
+
+[project.gui-scripts]
+copybook-gui = "copybook.gui:main"
+
+[dependency-groups]
+dev = [
+    "opencv-python-headless>=5.1.0.95",
+    "pyinstaller>=6.22.3",
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/copybook"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "latex: needs XeLaTeX and the Make Me a Hanzi data (deselect with -m 'not latex')",
+]

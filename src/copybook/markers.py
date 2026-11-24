@@ -1,0 +1,280 @@
+"""ArUco page markers, the book QR code and the geometry sidecar.
+
+Every page gets four ``DICT_4X4_1000`` markers, one per corner, so the
+calligraphy checker can find the page in a photo, identify it and map photo
+pixels back to page millimetres. A JSON sidecar written next to the PDF lists
+the exact position of every marker and every cell; it is the single source of
+truth for the checker.
+
+Marker IDs: ``id = 4 * (page_index mod 250) + corner`` with corners numbered
+0 top-left, 1 top-right, 2 bottom-right, 3 bottom-left and ``page_index`` the
+0-based physical page in the A5 PDF. Page 0 is a recto: its gutter (the fold)
+is on the left.
+
+All positions are computed here, in Python. The TeX side only looks them up:
+markers are drawn from a shipout hook (so LaTeX-generated pages such as the
+index and blank versos get them too), choosing the recto or verso set by page
+parity.
+"""
+
+from __future__ import annotations
+
+import json
+import secrets
+from dataclasses import dataclass, replace
+from datetime import datetime
+from functools import cache
+from importlib import resources
+from pathlib import Path
+
+import segno
+
+from copybook import CopybookError, __version__
+from copybook.settings import MarkerSettings, PageSettings
+from copybook.tex import mm
+
+DICTIONARY = "DICT_4X4_1000"
+MODULES = 6  # 4 data bits + 1-module black border on each side
+SLOTS = 250
+CORNERS = ("tl", "tr", "br", "bl")
+_SAFETY = 0.5  # mm between a quiet zone and the grid frame (line widths stick out)
+
+
+@cache
+def patterns() -> tuple[str, ...]:
+    """Inner 4 x 4 bits per marker ID, row by row, '1' = white module."""
+    text = resources.files("copybook").joinpath("aruco_4x4_1000.txt").read_text(encoding="ascii")
+    rows = tuple(text.split())
+    if len(rows) != 1000:
+        raise CopybookError("aruco_4x4_1000.txt is damaged; run tools/make_aruco_table.py")
+    return rows
+
+
+def marker_id(page_index: int, corner: int) -> int:
+    return 4 * (page_index % SLOTS) + corner
+
+
+def side(page_index: int) -> str:
+    return "recto" if page_index % 2 == 0 else "verso"
+
+
+def new_book_id() -> str:
+    return secrets.token_hex(4)
+
+
+@dataclass(frozen=True)
+class MarkerBox:
+    corner: int  # 0 tl, 1 tr, 2 br, 3 bl
+    x: float  # top-left corner, mm
+    y: float
+    size: float
+
+    @property
+    def corners(self) -> list[list[float]]:
+        x, y, s = self.x, self.y, self.size
+        return [[x, y], [x + s, y], [x + s, y + s], [x, y + s]]
+
+    @property
+    def center(self) -> list[float]:
+        return [self.x + self.size / 2, self.y + self.size / 2]
+
+
+class MarkerLayout:
+    """Where the markers go on recto and verso pages, and what space they take."""
+
+    def __init__(self, settings: MarkerSettings, page_size: tuple[float, float]):
+        self.settings = settings
+        self.width, self.height = page_size
+        s = settings
+        self.band = s.outer_margin + s.size + s.quiet + _SAFETY  # reserved at top and bottom
+        self.header_y = s.outer_margin + s.size / 2  # running head sits between the top markers
+        self.footer_y = self.height - s.outer_margin - s.size / 2  # page number between the bottom ones
+
+        inner = max(s.outer_margin, s.gutter_margin)
+        free = self.width - 2 * (inner + s.size + s.quiet)
+        if free < 30:
+            raise CopybookError("Markers leave less than 30 mm between them for the running head")
+        if 2 * self.band >= self.height - 20:
+            raise CopybookError("Markers leave no room for the grid")
+
+    def boxes(self, page_side: str) -> list[MarkerBox]:
+        s = self.settings
+        if page_side == "recto":  # fold on the left
+            left, right = s.gutter_margin, self.width - s.outer_margin - s.size
+        else:
+            left, right = s.outer_margin, self.width - s.gutter_margin - s.size
+        top, bottom = s.outer_margin, self.height - s.outer_margin - s.size
+        return [
+            MarkerBox(0, left, top, s.size),
+            MarkerBox(1, right, top, s.size),
+            MarkerBox(2, right, bottom, s.size),
+            MarkerBox(3, left, bottom, s.size),
+        ]
+
+    def text_span(self) -> tuple[float, float]:
+        """Horizontal span free of quiet zones on both recto and verso pages."""
+        s = self.settings
+        inner = max(s.outer_margin, s.gutter_margin)
+        return inner + s.size + s.quiet, self.width - inner - s.size - s.quiet
+
+    def adjust(self, page: PageSettings) -> PageSettings:
+        """Grow the header and footer bands so the grid stays clear of the markers."""
+        return replace(
+            page,
+            header=max(page.header, self.band - page.border),
+            footer=max(page.footer, self.band - page.border),
+        )
+
+    # -- TeX ---------------------------------------------------------------
+
+    def tex_definitions(self) -> str:
+        """Marker patterns (as white-module fills) and the marker macro; goes in a separate file."""
+        lines = [
+            "% ArUco DICT_4X4_1000 patterns, generated by copybook.markers",
+            r"\makeatletter",
+            r"\def\cb@w#1#2{\fill[white] (#1,#2) rectangle ++(1,1);}",
+        ]
+        for marker, bits in enumerate(patterns()):
+            whites = "".join(f"\\cb@w{1 + i % 4}{1 + i // 4}" for i, bit in enumerate(bits) if bit == "1")
+            lines.append(f"\\@namedef{{cb@aruco@{marker}}}{{{whites}}}")
+        lines.append(r"\makeatother")
+        return "\n".join(lines) + "\n"
+
+    def tex_preamble(self) -> str:
+        s = self.settings
+        module = s.size / MODULES
+        quiet = s.quiet / module
+
+        def placements(page_side: str) -> str:
+            return "".join(
+                f"\\cbmarker{{\\the\\numexpr4*\\cb@slot+{b.corner}\\relax}}{{{mm(b.x)}}}{{{mm(b.y)}}}"
+                for b in self.boxes(page_side)
+            )
+
+        return rf"""
+\input{{aruco.tex}}
+\makeatletter
+% \cbmarker{{id}}{{x mm}}{{y mm}}: quiet zone, solid black square, then the white modules
+% (painting white over black avoids hairline seams between black modules).
+\newcommand{{\cbmarker}}[3]{{\begin{{scope}}[shift={{(#2,#3)}},x={mm(module)}mm,y=-{mm(module)}mm]
+  \fill[white] ({-quiet:.4f},{-quiet:.4f}) rectangle ({MODULES + quiet:.4f},{MODULES + quiet:.4f});
+  \fill[black] (0,0) rectangle ({MODULES},{MODULES});
+  \csname cb@aruco@#1\endcsname
+\end{{scope}}}}
+\newcount\cb@slot
+\def\cb@modslot{{\ifnum\cb@slot>{SLOTS - 1} \advance\cb@slot -{SLOTS}\relax\expandafter\cb@modslot\fi}}
+\def\cb@recto{{{placements("recto")}}}
+\def\cb@verso{{{placements("verso")}}}
+% Physical page n (1-based) has page_index n-1; odd n is a recto.
+\AddToHook{{shipout/background}}{{\put(0,0){{\begin{{tikzpicture}}[overlay,x=1mm,y=-1mm]
+  \cb@slot=\numexpr\ReadonlyShipoutCounter-1\relax\cb@modslot
+  \ifodd\ReadonlyShipoutCounter\relax\cb@recto\else\cb@verso\fi
+\end{{tikzpicture}}}}}}
+\makeatother
+"""
+
+    def page_record(self, page_index: int) -> dict:
+        page_side = side(page_index)
+        return {
+            "page_index": page_index,
+            "side": page_side,
+            "gutter": "left" if page_side == "recto" else "right",
+            "markers": [
+                {
+                    "id": marker_id(page_index, b.corner),
+                    "corner": CORNERS[b.corner],
+                    "center": _round(b.center),
+                    "corners": _round(b.corners),
+                }
+                for b in self.boxes(page_side)
+            ],
+        }
+
+
+def _round(value):
+    if isinstance(value, list):
+        return [_round(v) for v in value]
+    return round(value, 3)
+
+
+# ---------------------------------------------------------------------------
+# Book QR code
+# ---------------------------------------------------------------------------
+
+
+def qr_payload(book_id: str, pattern: str, cell: float) -> str:
+    return f"cc1;{book_id};{pattern};{cell:g}"
+
+
+def qr_tikz(payload: str, x: float, y: float, size: float) -> str:
+    """TikZ fills for a QR code whose top-left corner (quiet zone excluded) is at (x, y)."""
+    matrix = segno.make(payload, error="m").matrix
+    module = size / len(matrix)
+    rects = []
+    for r, row in enumerate(matrix):
+        c = 0
+        while c < len(row):  # one rectangle per horizontal run of dark modules
+            if row[c]:
+                start = c
+                while c < len(row) and row[c]:
+                    c += 1
+                rects.append(
+                    f"({mm(x + start * module)},{mm(y + r * module)}) rectangle "
+                    f"({mm(x + c * module)},{mm(y + (r + 1) * module)})"
+                )
+            else:
+                c += 1
+    margin = 4 * module  # QR quiet zone
+    return (
+        f"\\fill[white] ({mm(x - margin)},{mm(y - margin)}) rectangle ({mm(x + size + margin)},{mm(y + size + margin)});\n"
+        "\\fill[black] " + " ".join(rects) + ";"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sidecar
+# ---------------------------------------------------------------------------
+
+
+def sidecar_path(pdf: Path, book_id: str) -> Path:
+    return pdf.with_name(f"{pdf.stem}.{book_id}.geometry.json")
+
+
+def write_sidecar(
+    path: Path,
+    header: dict,
+    layout: MarkerLayout,
+    total_pages: int,
+    grid_pages: list[dict],
+    has_cover: bool,
+) -> Path:
+    """Describe every physical page. Grid pages are the last ``len(grid_pages)`` pages."""
+    first_grid = total_pages - len(grid_pages)
+    if first_grid < 0:
+        raise CopybookError("The PDF has fewer pages than the layout produced")
+
+    pages = []
+    for index in range(total_pages):
+        record = layout.page_record(index)
+        if index >= first_grid:
+            record.update({"kind": "grid", **grid_pages[index - first_grid]})
+        else:
+            record.update({"kind": "cover" if has_cover and index == 0 else "text", "grid_area": None, "cells": []})
+        pages.append(record)
+
+    data = {
+        "schema_version": 1,
+        **header,
+        "generator": f"copybook {__version__}",
+        "created": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "page_size_mm": [layout.width, layout.height],
+        "marker": {
+            "dictionary": DICTIONARY,
+            "size_mm": layout.settings.size,
+            "quiet_zone_mm": layout.settings.quiet,
+            "id_formula": "4 * (page_index mod 250) + corner; corner 0 tl, 1 tr, 2 br, 3 bl",
+        },
+        "pages": pages,
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return path

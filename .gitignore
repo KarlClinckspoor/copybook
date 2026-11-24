@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv
+
+# Downloaded datasets (recreate with `copybook data`)
+data/
+
+# Generated PDFs, LaTeX build files and glyph cache
+output/
+
+# Fonts are licensed separately; do not commit them
+fonts/
+
+# Pre-restructure scripts and outputs, kept locally for reference
+legacy/
+
+# Personal flashcard export (input to `copybook learned-chars`)
+input/learning_progress_export.json
+
+# Design handoff notes
+page marker spec.md

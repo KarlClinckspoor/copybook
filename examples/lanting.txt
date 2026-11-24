@@ -1,0 +1,4 @@
+# Opening of the Lanting Xu (兰亭序, Wang Xizhi, 353 CE), in simplified characters.
+# Lines starting with # are ignored; everything that is not a Chinese character is skipped.
+永和九年，岁在癸丑，暮春之初，会于会稽山阴之兰亭，修禊事也。
+群贤毕至，少长咸集。此地有崇山峻岭，茂林修竹，又有清流激湍，映带左右。

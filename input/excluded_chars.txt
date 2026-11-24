@@ -1,0 +1,3 @@
+# Characters to leave out when running `copybook learned-chars`.
+# Mostly components and rare forms without stroke data. Lines starting with # are ignored.
+囧𡗗龷𫠣𣦼㐫𰀁𢆉𠬤龰𠆢𠂉𠂆龶㫃𠂢𡰯𡨄𢀖龸𰀡𢀳𠀎𠕁𠃓朩𧘇𠤕𠫓冃𠂇䒑
